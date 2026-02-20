@@ -5,3 +5,4 @@ numpy
 ta
 firebase-admin
 python-dotenv
+requests
