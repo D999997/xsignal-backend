@@ -1,3 +1,6 @@
+# =========================
+# main.py (FULL WORKING)
+# =========================
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Literal, Optional
@@ -12,12 +15,17 @@ from ai.scoring import score_signal
 # ✅ Scheduler
 from ai.scheduler import start_scheduler
 
-app = FastAPI(title="Xsignal AI Backend", version="0.3.0")
+# ✅ Data feed (Binance)
+from ai.data_feed import fetch_ohlcv_binance
+
+app = FastAPI(title="Xsignal AI Backend", version="0.3.2")
+
 
 # ---------------------------
 # Firebase (optional)
 # ---------------------------
 db = None
+
 
 def _init_firebase():
     """
@@ -61,42 +69,54 @@ def _init_firebase():
         print(f"⚠️ Firebase init failed. Firestore disabled. Reason: {e}")
         db = None
 
+
 _init_firebase()
+
 
 # ✅ Start scheduler when server starts
 @app.on_event("startup")
 def startup_event():
     start_scheduler()
 
+
 # ---------------------------
 # Request model
 # ---------------------------
 class GenerateSignalRequest(BaseModel):
-    symbol: str
-    mode: Literal["scalp", "swing"]
-    timeframe: str
-    market: Optional[str] = "forex"
+    symbol: str                         # e.g. BTCUSDT
+    mode: Literal["scalp", "swing"]      # scalp / swing
+    timeframe: str                      # e.g. "1m", "5m", "1h"
+    market: Optional[str] = "crypto"
     tier: Optional[str] = "pro"
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.get("/")
 def root():
     return {"message": "Xsignal backend running"}
 
+
 @app.post("/signals/generate")
 def signals_generate(req: GenerateSignalRequest):
     try:
-        sig = generate_signal(
+        # 1) Fetch candles -> DataFrame (Binance)
+        df = fetch_ohlcv_binance(
             symbol=req.symbol,
-            timeframe=req.timeframe,
-            mode=req.mode,
-            market=req.market or "forex",
+            interval=req.timeframe,
+            limit=200,
         )
 
-        sig = score_signal(sig)
+        # 2) Generate raw signal (or None)
+        raw = generate_signal(df, mode=req.mode)
+        if raw is None:
+            return {"status": "no_signal", "reason": "No breakout / BOS trigger"}
+
+        # 3) Score signal (confidence)
+        sig = score_signal(raw)
 
         signal_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
@@ -113,10 +133,11 @@ def signals_generate(req: GenerateSignalRequest):
             **sig,
         }
 
+        # 4) Store in Firestore if enabled
         if db is not None:
             db.collection("signals").document(signal_id).set(payload)
 
         return payload
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
