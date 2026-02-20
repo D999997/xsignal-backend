@@ -1,5 +1,5 @@
 # =========================
-# main.py (FULL WORKING)
+# main.py (AUTO TIMEFRAME + TEST OHLCV)
 # =========================
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -18,7 +18,7 @@ from ai.scheduler import start_scheduler
 # ✅ Data feed (Binance)
 from ai.data_feed import fetch_ohlcv_binance
 
-app = FastAPI(title="Xsignal AI Backend", version="0.3.2")
+app = FastAPI(title="Xsignal AI Backend", version="0.3.4")
 
 
 # ---------------------------
@@ -26,12 +26,11 @@ app = FastAPI(title="Xsignal AI Backend", version="0.3.2")
 # ---------------------------
 db = None
 
-
 def _init_firebase():
     """
     Priority:
-    1) Railway env var: FIREBASE_CREDENTIALS_JSON  (recommended for production)
-    2) Local file: firebase_admin.json             (optional for local dev)
+    1) Railway env var: FIREBASE_CREDENTIALS_JSON (prod)
+    2) Local file: firebase_admin.json (dev)
     """
     global db
     try:
@@ -39,14 +38,12 @@ def _init_firebase():
         import firebase_admin
         from firebase_admin import credentials, firestore
 
-        # If already initialized, just grab Firestore client
         if firebase_admin._apps:
             db = firestore.client()
             return
 
         firebase_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
 
-        # ✅ 1) Production (Railway): use env var JSON
         if firebase_json and len(firebase_json) > 50:
             cred = credentials.Certificate(json.loads(firebase_json))
             firebase_admin.initialize_app(cred)
@@ -54,7 +51,6 @@ def _init_firebase():
             print("✅ Firebase Admin initialized (env)")
             return
 
-        # ✅ 2) Local dev fallback: use file if it exists
         if os.path.exists("firebase_admin.json") and os.path.getsize("firebase_admin.json") > 50:
             cred = credentials.Certificate("firebase_admin.json")
             firebase_admin.initialize_app(cred)
@@ -69,13 +65,12 @@ def _init_firebase():
         print(f"⚠️ Firebase init failed. Firestore disabled. Reason: {e}")
         db = None
 
-
 _init_firebase()
 
 
-# ✅ Start scheduler when server starts
 @app.on_event("startup")
 def startup_event():
+    # If you don’t want scheduler in dev, you can comment this line.
     start_scheduler()
 
 
@@ -83,16 +78,16 @@ def startup_event():
 # Request model
 # ---------------------------
 class GenerateSignalRequest(BaseModel):
-    symbol: str                         # e.g. BTCUSDT
-    mode: Literal["scalp", "swing"]      # scalp / swing
-    timeframe: str                      # e.g. "1m", "5m", "1h"
+    symbol: str
+    mode: Literal["scalp", "swing"]
+    timeframe: Optional[str] = None  # optional now
     market: Optional[str] = "crypto"
     tier: Optional[str] = "pro"
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"ok": True}
 
 
 @app.get("/")
@@ -100,22 +95,37 @@ def root():
     return {"message": "Xsignal backend running"}
 
 
+# ✅ Step 40.6 — Manual OHLCV test endpoint
+@app.get("/test_ohlcv")
+def test_ohlcv(pair: str = "BTCUSDT", timeframe: str = "5m"):
+    try:
+        df = fetch_ohlcv_binance(symbol=pair, interval=timeframe, limit=50)
+        last = df.iloc[-1].to_dict() if len(df) > 0 else None
+        return {
+            "pair": pair,
+            "timeframe": timeframe,
+            "rows": len(df),
+            "last": last,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
 @app.post("/signals/generate")
 def signals_generate(req: GenerateSignalRequest):
     try:
-        # 1) Fetch candles -> DataFrame (Binance)
-        df = fetch_ohlcv_binance(
-            symbol=req.symbol,
-            interval=req.timeframe,
-            limit=200,
-        )
+        # ✅ Step 40.4 — auto timeframe by mode (if not provided)
+        tf = req.timeframe or ("5m" if req.mode == "scalp" else "1h")
 
-        # 2) Generate raw signal (or None)
+        # 1) Fetch candles
+        df = fetch_ohlcv_binance(symbol=req.symbol, interval=tf, limit=200)
+
+        # 2) Generate signal
         raw = generate_signal(df, mode=req.mode)
         if raw is None:
             return {"status": "no_signal", "reason": "No breakout / BOS trigger"}
 
-        # 3) Score signal (confidence)
+        # 3) Score
         sig = score_signal(raw)
 
         signal_id = str(uuid.uuid4())
@@ -125,7 +135,7 @@ def signals_generate(req: GenerateSignalRequest):
             "id": signal_id,
             "symbol": req.symbol.upper(),
             "mode": req.mode,
-            "timeframe": req.timeframe,
+            "timeframe": tf,
             "market": req.market,
             "tier": req.tier,
             "status": "active",
