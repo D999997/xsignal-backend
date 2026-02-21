@@ -2,6 +2,7 @@
 # main.py (MULTI-TF + KILL SWITCH + TIER ROUTING)
 # =========================
 from fastapi import FastAPI, HTTPException
+from firebase_admin import firestore  # ✅ ADD THIS
 from pydantic import BaseModel
 from typing import Literal, Optional
 from datetime import datetime, timezone
@@ -41,10 +42,10 @@ def _init_firebase():
     try:
         import json
         import firebase_admin
-        from firebase_admin import credentials, firestore
+        from firebase_admin import credentials, firestore as _fs
 
         if firebase_admin._apps:
-            db = firestore.client()
+            db = _fs.client()
             return
 
         firebase_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
@@ -52,14 +53,14 @@ def _init_firebase():
         if firebase_json and len(firebase_json) > 50:
             cred = credentials.Certificate(json.loads(firebase_json))
             firebase_admin.initialize_app(cred)
-            db = firestore.client()
+            db = _fs.client()
             print("✅ Firebase Admin initialized (env)")
             return
 
         if os.path.exists("firebase_admin.json") and os.path.getsize("firebase_admin.json") > 50:
             cred = credentials.Certificate("firebase_admin.json")
             firebase_admin.initialize_app(cred)
-            db = firestore.client()
+            db = _fs.client()
             print("✅ Firebase Admin initialized (file)")
             return
 
@@ -222,3 +223,40 @@ def signals_generate(req: GenerateSignalRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+# ✅ STEP 42.3 — Approve endpoint (moves doc from signal_queue -> signals)
+@app.post("/admin/approve/{queue_id}")
+def approve_signal(queue_id: str):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Firestore not initialized")
+
+    queue_ref = db.collection("signal_queue").document(queue_id)
+    queue_doc = queue_ref.get()
+
+    if not queue_doc.exists:
+        raise HTTPException(status_code=404, detail="Queue item not found")
+
+    data = queue_doc.to_dict() or {}
+
+    if data.get("status") != "pending":
+        raise HTTPException(status_code=400, detail="Signal already processed")
+
+    # Remove queue-only fields
+    data.pop("status", None)
+
+    # Write to published signals collection
+    signal_ref = db.collection("signals").document()
+    signal_ref.set({
+        **data,
+        "status": "active",
+        "approvedAt": firestore.SERVER_TIMESTAMP,
+    })
+
+    # Delete from queue
+    queue_ref.delete()
+
+    return {
+        "status": "approved",
+        "signalId": signal_ref.id
+    }
