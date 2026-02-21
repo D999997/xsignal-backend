@@ -6,3 +6,4 @@ ta
 firebase-admin
 python-dotenv
 requests
+apscheduler==3.10.4
