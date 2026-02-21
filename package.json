@@ -1,0 +1,24 @@
+{
+  "name": "xsignal-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/D999997/xsignal-backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/D999997/xsignal-backend/issues"
+  },
+  "homepage": "https://github.com/D999997/xsignal-backend#readme",
+  "dependencies": {
+    "firebase-admin": "^13.6.1"
+  }
+}
