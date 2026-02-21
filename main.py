@@ -1,5 +1,5 @@
 # =========================
-# main.py (AUTO TIMEFRAME + TEST OHLCV)
+# main.py (MULTI-TF + KILL SWITCH + TIER ROUTING)
 # =========================
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -10,7 +10,12 @@ import os
 
 # --- AI modules ---
 from ai.signal_engine import generate_signal
-from ai.scoring import score_signal
+
+# ✅ Multi-TF + Xscore + tier routing + config
+from ai.multi_tf import multi_tf_confirm
+from ai.scoring import calculate_xscore
+from ai.tier_router import tier_from_xscore
+from ai.config import load_engine_config
 
 # ✅ Scheduler
 from ai.scheduler import start_scheduler
@@ -18,7 +23,7 @@ from ai.scheduler import start_scheduler
 # ✅ Data feed (Binance)
 from ai.data_feed import fetch_ohlcv_binance
 
-app = FastAPI(title="Xsignal AI Backend", version="0.3.4")
+app = FastAPI(title="Xsignal AI Backend", version="0.3.5")
 
 
 # ---------------------------
@@ -65,12 +70,14 @@ def _init_firebase():
         print(f"⚠️ Firebase init failed. Firestore disabled. Reason: {e}")
         db = None
 
+
+# ✅ Initialize Firebase before startup event
 _init_firebase()
 
 
 @app.on_event("startup")
 def startup_event():
-    # If you don’t want scheduler in dev, you can comment this line.
+    # Scheduler will safely handle Firestore not initialized
     start_scheduler()
 
 
@@ -80,9 +87,9 @@ def startup_event():
 class GenerateSignalRequest(BaseModel):
     symbol: str
     mode: Literal["scalp", "swing"]
-    timeframe: Optional[str] = None  # optional now
+    timeframe: Optional[str] = None  # optional; will auto-set from mode
     market: Optional[str] = "crypto"
-    tier: Optional[str] = "pro"
+    tier: Optional[str] = "pro"      # used only for display; routing uses cfg thresholds
 
 
 @app.get("/health")
@@ -95,7 +102,7 @@ def root():
     return {"message": "Xsignal backend running"}
 
 
-# ✅ Step 40.6 — Manual OHLCV test endpoint
+# ✅ Manual OHLCV test endpoint
 @app.get("/test_ohlcv")
 def test_ohlcv(pair: str = "BTCUSDT", timeframe: str = "5m"):
     try:
@@ -111,43 +118,107 @@ def test_ohlcv(pair: str = "BTCUSDT", timeframe: str = "5m"):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
+def _confidence_text(x: int) -> str:
+    if x >= 75:
+        return "VERY HIGH"
+    if x >= 60:
+        return "HIGH"
+    if x >= 45:
+        return "MEDIUM"
+    return "LOW"
+
+
 @app.post("/signals/generate")
 def signals_generate(req: GenerateSignalRequest):
+    """
+    ✅ Option B:
+    - Kill switch + pairs allowlist from Firestore config
+    - Multi-TF confirm (f5/f15/f1h) => side + features bundle
+    - Xscore from real features => calculate_xscore(bundle)
+    - Tier routing (free/pro/xpro/reject) using cfg thresholds
+    - Generate entry/SL/TP using mode timeframe df
+    - Force signal side to match multi-TF side
+    """
     try:
-        # ✅ Step 40.4 — auto timeframe by mode (if not provided)
+        symbol = req.symbol.upper().strip()
+
+        # ✅ Load config (kill switch + thresholds + pairs)
+        cfg = load_engine_config()
+
+        # Kill switch
+        if not cfg.get("enabled", True):
+            raise HTTPException(status_code=503, detail="Signal engine disabled")
+
+        # Pair allowlist
+        allowed_pairs = [p.upper().strip() for p in (cfg.get("pairs") or [])]
+        if allowed_pairs and symbol not in set(allowed_pairs):
+            raise HTTPException(status_code=400, detail=f"Pair not allowed: {symbol}")
+
+        # ✅ Multi-TF confirm defines side + features bundle
+        ok, side, feats = multi_tf_confirm(symbol)
+        if not ok:
+            return {"status": "no_signal", "reason": "multi_tf_confirm failed"}
+
+        # ✅ Real Xscore (0..100)
+        xscore = calculate_xscore(feats)
+
+        # ✅ Tier routing from config thresholds
+        routed_tier = tier_from_xscore(xscore, cfg)
+        if routed_tier == "reject":
+            return {
+                "status": "no_signal",
+                "reason": "xscore below thresholds",
+                "xscore": xscore,
+            }
+
+        # ✅ Auto timeframe by mode (or user override)
         tf = req.timeframe or ("5m" if req.mode == "scalp" else "1h")
 
-        # 1) Fetch candles
-        df = fetch_ohlcv_binance(symbol=req.symbol, interval=tf, limit=200)
+        # ✅ Fetch DF for entry/SL/TP generation
+        df = fetch_ohlcv_binance(symbol=symbol, interval=tf, limit=200)
 
-        # 2) Generate signal
+        # ✅ Generate raw signal from df
         raw = generate_signal(df, mode=req.mode)
         if raw is None:
             return {"status": "no_signal", "reason": "No breakout / BOS trigger"}
 
-        # 3) Score
-        sig = score_signal(raw)
+        # ✅ Force side to match multi-TF side
+        if raw.get("side") != side:
+            return {"status": "no_signal", "reason": "side mismatch multiTF"}
+
+        # ✅ Attach explainable scoring outputs
+        sig = dict(raw)
+        sig["confidence"] = xscore
+        sig["confidence_text"] = _confidence_text(xscore)
+
+        # Optional: include features bundle (you can remove later for free users)
+        sig["xscore_features"] = feats
+        sig["tier_routed"] = routed_tier
 
         signal_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
         payload = {
             "id": signal_id,
-            "symbol": req.symbol.upper(),
+            "symbol": symbol,
             "mode": req.mode,
             "timeframe": tf,
             "market": req.market,
-            "tier": req.tier,
+            # keep what user sent + what system routed (both useful for debugging)
+            "tier_requested": (req.tier or "pro"),
+            "tier": routed_tier,
             "status": "active",
             "createdAt": now,
             **sig,
         }
 
-        # 4) Store in Firestore if enabled
+        # ✅ Store in Firestore if enabled
         if db is not None:
             db.collection("signals").document(signal_id).set(payload)
 
         return payload
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")

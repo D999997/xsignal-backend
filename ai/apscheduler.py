@@ -1,170 +1,139 @@
+# ai/scheduler.py
+from __future__ import annotations
+
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, timezone
-import uuid
-import os
-import pandas as pd
 
-# Firebase (optional)
-db = None
-firestore = None
-
-def init_firestore():
-    """Initialize Firestore if firebase_admin.json exists and valid."""
-    global db, firestore
-    try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore as _firestore
-
-        firestore = _firestore
-
-        if firebase_admin._apps:
-            db = _firestore.client()
-            return
-
-        if not os.path.exists("firebase_admin.json"):
-            print("⚠️ firebase_admin.json not found. Scheduler publish disabled.")
-            db = None
-            return
-
-        if os.path.getsize("firebase_admin.json") < 50:
-            print("⚠️ firebase_admin.json looks empty. Scheduler publish disabled.")
-            db = None
-            return
-
-        cred = credentials.Certificate("firebase_admin.json")
-        firebase_admin.initialize_app(cred)
-        db = _firestore.client()
-        print("✅ Scheduler Firestore ready")
-    except Exception as e:
-        print(f"⚠️ Scheduler Firestore init failed: {e}")
-        db = None
-
-# ---- AI modules ----
 from ai.signal_engine import generate_signal
-from ai.scoring import score_signal
+from ai.multi_tf import multi_tf_confirm
+from ai.scoring import calculate_xscore
+from ai.tier_router import tier_from_xscore
+from ai.config import load_engine_config
+from ai.data_feed import fetch_ohlcv_binance  # ✅ use your real OHLC fetcher
+
+# Firestore optional
+db = None
+firestore_mod = None
 
 scheduler = BackgroundScheduler()
 _started = False
 
 
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Simple ATR implementation (no external TA dependency)."""
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
+def _try_init_firestore():
+    global db, firestore_mod
+    try:
+        import firebase_admin
+        from firebase_admin import firestore as fs
 
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
+        firestore_mod = fs
 
-    atr = tr.rolling(period).mean()
-    return atr
+        if not firebase_admin._apps:
+            print("⚠️ Scheduler: Firebase not initialized yet. Firestore disabled for scheduler.")
+            db = None
+            return
+
+        db = fs.client()
+        print("✅ Scheduler: Firestore client ready")
+    except Exception as e:
+        print(f"⚠️ Scheduler: Firestore unavailable ({e}). Scheduler will run without saving.")
+        db = None
 
 
-def scan_market(pair: str, mode: str, timeframe: str, market: str = "forex"):
-    """
-    Auto-scan + publish a signal.
-    Includes:
-      - Spam protection (no buy/buy repetition)
-      - Volatility filter (ATR too low -> skip)
-    """
-    # ---- 0) Load market data (TEMP DEMO) ----
-    # Replace this later with real OHLC fetcher
-    # For now, if sample_data.csv exists, use it; otherwise skip.
-    if not os.path.exists("sample_data.csv"):
-        print("⚠️ sample_data.csv not found; skipping scan.")
-        return
+def should_spam_block(pair: str, mode: str, side: str) -> bool:
+    if db is None or firestore_mod is None:
+        return False
 
-    df = pd.read_csv("sample_data.csv")
+    try:
+        recent = (
+            db.collection("signals")
+            .where("pair", "==", pair)
+            .where("mode", "==", mode)
+            .order_by("createdAt", direction=firestore_mod.Query.DESCENDING)
+            .limit(1)
+            .stream()
+        )
+        recent_list = list(recent)
+        if not recent_list:
+            return False
 
-    # Require columns for ATR
-    required_cols = {"high", "low", "close"}
-    if not required_cols.issubset(set(df.columns)):
-        print("⚠️ sample_data.csv must contain high, low, close columns.")
-        return
+        last_signal = recent_list[0].to_dict()
+        return last_signal.get("side") == side
+    except Exception as e:
+        print(f"⚠️ Spam check failed: {e}")
+        return False
 
-    # ---- 1) ATR + Volatility Filter (STEP 39.5) ----
-    df["atr"] = compute_atr(df, period=14)
 
-    if df["atr"].dropna().empty:
-        print("⚠️ ATR not ready yet; skipping.")
-        return
-
-    atr_now = df["atr"].iloc[-1]
-    atr_mean = df["atr"].rolling(50).mean().iloc[-1]
-
-    # market too quiet
-    if pd.notna(atr_mean) and atr_now < atr_mean * 0.7:
-        print("😴 Volatility too low, skipping signal.")
-        return
-
-    # ---- 2) Generate signal ----
-    sig = generate_signal(
-        symbol=pair,
-        timeframe=timeframe,
-        mode=mode,
-        market=market,
-    )
-    if not sig:
-        print("❌ No signal found.")
-        return
-
-    sig = score_signal(sig)
-
-    # ---- 3) Spam protection (STEP 39.4) ----
-    # Only works if Firestore enabled
-    if db is not None and firestore is not None:
-        try:
-            recent = (
-                db.collection("signals")
-                .where("symbol", "==", pair)
-                .where("mode", "==", mode)
-                .order_by("createdAt", direction=firestore.Query.DESCENDING)
-                .limit(1)
-                .stream()
-            )
-            recent_list = list(recent)
-
-            if recent_list:
-                last_signal = recent_list[0].to_dict()
-                if last_signal.get("side") == sig.get("side"):
-                    print("🛑 Spam protection: same side as last signal. Skipping.")
-                    return
-        except Exception as e:
-            print(f"⚠️ Spam check failed (continuing anyway): {e}")
-
-    # ---- 4) Build payload + publish ----
-    signal_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-
+def publish_signal(pair: str, mode: str, side: str, xscore: int, signal: dict, features: dict, tier: str):
     payload = {
-        "id": signal_id,
-        "symbol": pair,
+        "pair": pair,
         "mode": mode,
-        "timeframe": timeframe,
-        "market": market,
-        "tier": "pro",
-        "status": "active",
-        "createdAt": now,
-        **sig,
+        "tier": tier,
+        "side": side,
+        "xscore": xscore,
+        "createdAt": (firestore_mod.SERVER_TIMESTAMP if firestore_mod else None),
+        "features": features,
+        **signal,
     }
 
-    # Publish to Firestore if enabled
-    if db is not None:
-        try:
-            db.collection("signals").document(signal_id).set(payload)
-            print("✅ Published signal:", payload["id"], payload["symbol"], payload["side"])
-        except Exception as e:
-            print(f"❌ Publish failed: {e}")
-    else:
-        # If no Firestore, just log
-        print("🟡 Firestore disabled. Signal generated:", payload)
+    if db is None:
+        print(f"[SIGNAL] {pair} {mode} {side} tier={tier} xscore={xscore} (not saved: no firestore)")
+        return
+
+    try:
+        db.collection("signals").add(payload)
+        print(f"[PUBLISHED] {pair} {mode} {side} tier={tier} xscore={xscore}")
+    except Exception as e:
+        print(f"⚠️ Publish failed: {e}")
+
+
+def scan_pair(pair: str, mode: str):
+    cfg = load_engine_config()
+
+    # ✅ Kill switch
+    if not cfg.get("enabled", True):
+        print("[ENGINE OFF] Kill switch enabled")
+        return
+
+    pair = pair.upper().strip()
+
+    # ✅ Pair allowlist
+    allowed = [p.upper().strip() for p in (cfg.get("pairs") or [])]
+    if allowed and pair not in set(allowed):
+        return
+
+    # ✅ Multi-TF confirm => (ok, side, feats_bundle)
+    ok, side, feats = multi_tf_confirm(pair)
+    if not ok:
+        return
+
+    # ✅ Real xscore from features bundle
+    try:
+        xscore = calculate_xscore(feats)   # feats must include f5,f15,f1h
+    except Exception as e:
+        print(f"⚠️ Xscore calc failed for {pair}: {e}")
+        return
+
+    # ✅ Tier routing (reject / free / pro / xpro)
+    tier = tier_from_xscore(xscore, cfg)
+    if tier == "reject":
+        return
+
+    # ✅ Generate entry/SL/TP from the mode timeframe df
+    tf = "5m" if mode == "scalp" else "1h"
+    df = fetch_ohlcv_binance(pair, tf, 300)
+
+    signal = generate_signal(df, mode)
+    if not signal:
+        return
+
+    # Force side to match multi-tf side
+    if signal.get("side") != side:
+        return
+
+    # ✅ Spam block
+    if should_spam_block(pair, mode, side):
+        return
+
+    publish_signal(pair, mode, side, xscore, signal, feats, tier)
 
 
 def start_scheduler():
@@ -172,19 +141,21 @@ def start_scheduler():
     if _started:
         return
 
-    init_firestore()
+    _try_init_firestore()
 
-    # Demo schedule: every 60 seconds.
-    # Later: scalp every 5m, swing every 30m.
-    scheduler.add_job(
-        scan_market,
-        "interval",
-        seconds=60,
-        kwargs={"pair": "XAUUSD", "mode": "scalp", "timeframe": "5m", "market": "forex"},
-        id="scan_xauusd_scalp",
-        replace_existing=True,
-    )
+    def scalp_job():
+        cfg = load_engine_config()
+        for p in (cfg.get("pairs") or []):
+            scan_pair(p, "scalp")
+
+    def swing_job():
+        cfg = load_engine_config()
+        for p in (cfg.get("pairs") or []):
+            scan_pair(p, "swing")
+
+    scheduler.add_job(scalp_job, "interval", minutes=5, id="scan_scalp", replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(swing_job, "interval", hours=1, id="scan_swing", replace_existing=True, max_instances=1, coalesce=True)
 
     scheduler.start()
     _started = True
-    print("🟢 Scheduler started (auto-scan enabled)")
+    print("✅ Scheduler started (multi-TF + kill switch + tier routing)")
